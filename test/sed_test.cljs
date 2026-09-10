@@ -1,0 +1,151 @@
+;; test/sed_test.cljs -- build the command and compare it with the system sed,
+;; byte for byte, on stdout, stderr AND exit status.
+;;
+;; Every script here uses a LITERAL pattern. That is not a convenience: this
+;; has no regular expression engine, so a pattern containing a metacharacter
+;; means something different to the two implementations and comparing them
+;; would be comparing two different questions. `s/^/>/` is in the README as
+;; a named divergence rather than in this file as a case.
+
+(ns sed-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      (clj->js (merge {:encoding "buffer"} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-sed "/usr/bin/sed")
+
+(def fixtures
+  {"plain"  "aXbXc\nnope\nXstart\n"
+   ;; Two occurrences on one line, so `g` and the default differ visibly.
+   "twice"  "XX\n"
+   ;; A replacement that CONTAINS the pattern, which is how a `g` that
+   ;; rescanned from the start instead of after the match would hang.
+   "loop"   "a\n"
+   "empty"  ""
+   ;; No trailing newline: sed keeps it that way.
+   "nonl"   "aXb"
+   ;; Multi-byte on both sides of the match.
+   "utf8"   "日X本\n"
+   ;; A line that is only the pattern.
+   "bare"   "X\n"
+   ;; A MULTI-character pattern, repeated. Every other fixture's pattern is
+   ;; one byte, which makes "advance past the match" and "advance one byte"
+   ;; the same thing -- so without this the scan-advance is untested, and a
+   ;; control that broke it passed all 29 other cases.
+   "runs"   "aaaa\n"})
+
+(def cases
+  [["s/X/-/" "plain"] ["s/X/-/g" "plain"]
+   ["s/X/-/" "twice"] ["s/X/-/g" "twice"]
+   ;; No match anywhere: every line unchanged.
+   ["s/zz/-/" "plain"] ["s/zz/-/g" "plain"]
+   ;; An empty replacement deletes.
+   ["s/X//" "plain"] ["s/X//g" "plain"]
+   ;; The replacement contains the pattern. Under `g` the scan must continue
+   ;; AFTER the replacement, or this does not terminate.
+   ["s/a/aa/g" "loop"] ["s/a/aa/" "loop"]
+   ;; An empty file produces nothing.
+   ["s/X/-/" "empty"]
+   ;; The last line has no newline, and must still have none.
+   ["s/X/-/" "nonl"] ["s/X/-/g" "nonl"]
+   ;; Multi-byte either side of the match.
+   ["s/X/-/" "utf8"] ["s/日/Z/" "utf8"]
+   ;; A line that is exactly the pattern, replaced and deleted.
+   ["s/X/-/" "bare"] ["s/X//" "bare"]
+   ;; A delimiter that is not `/`.
+   ["s|X|-|" "plain"] ["s|X|-|g" "plain"]
+   ;; An empty pattern is refused, not treated as matching everywhere.
+   ["s//-/" "plain"]
+   ;; A missing operand.
+   ["s/X/-/" "missing"]
+   ;; Several operands: concatenated, and the unterminated one keeps its
+   ;; termination wherever it sits.
+   ["s/X/-/" "plain" "twice"] ["s/X/-/" "nonl" "plain"]
+   ["s/X/-/" "plain" "nonl"]
+   ;; A missing operand among readable ones: the readable ones are still
+   ;; written and the exit status is 1.
+   ["s/X/-/" "plain" "missing"] ["s/X/-/" "missing" "plain"]
+   ;; THE pair that distinguishes "another OPERAND follows" from "another
+   ;; LINE follows". An unterminated last line is closed only when a real
+   ;; line comes after it -- a missing or empty follower does not count, so
+   ;; both of these must stay unterminated. An implementation keying off the
+   ;; operand index passes every other multi-operand case and fails these.
+   ["s/X/-/" "nonl" "missing"] ["s/X/-/" "nonl" "empty"]
+   ;; And the empty operand in the middle, where a real line does follow.
+   ["s/X/-/" "nonl" "empty" "plain"]
+   ;; A two-character pattern over four repeats: `aa` twice, not `aa` then a
+   ;; leftover. This is the case that pins the scan advancing PAST the match
+   ;; rather than by one byte.
+   ["s/aa/X/g" "runs"] ["s/aa/X/" "runs"] ["s/aa/aab/g" "runs"]])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      packager (.join path amu-home "scripts" "package-command.cljs")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-sed) (refuse (str "no " system-sed " to compare against")))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-sed-"))
+        src (.resolve path (.cwd js/process) "sed" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "sed.kexe")
+        blob (.join path tmp "sed.bin")
+        exe (.join path tmp "sed")
+        data (.join path tmp "data")]
+    (.writeFileSync fs policy
+                    "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (.mkdirSync fs data)
+    (doseq [[name content] fixtures]
+      (.writeFileSync fs (.join path data name) content "utf8"))
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      (let [p (run "nbb" [packager "--code" blob "--offset" offset "--isa" "aarch64"
+                          "--allow" "35,37,38,39"
+                          "--fs-scope" (.realpathSync fs data)
+                          "--string-pool" "4000000" "--fuel" "50000000"
+                          "--pairs" "200000" "--output" exe] {})]
+        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
+
+    (let [real (.realpathSync fs data)
+          results
+          (for [names cases]
+            ;; The first element is the SCRIPT and every one after it a path.
+            (let [argv (into [(first names)]
+                             (mapv #(.join path real %) (rest names)))
+                  k (run exe argv {})
+                  s (run system-sed argv {})
+                  same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
+                             (= (:status k) (:status s)))]
+              {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
+               :system (.toString (:out s) "utf8")
+               :exit [(:status k) (:status s)]}))
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r))
+                      " -> " (pr-str (:kotoba r))
+                      (when-not (:ok r)
+                        (str " but " system-sed " says " (pr-str (:system r))
+                             " exits " (pr-str (:exit r)))))))
+      (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))

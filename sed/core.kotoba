@@ -1,0 +1,225 @@
+;; sed -- POSIX sed (IEEE Std 1003.1), the substitute command with LITERAL
+;; patterns.
+;;
+;;   sed 's/PATTERN/REPLACEMENT/' FILE...
+;;   sed 's/PATTERN/REPLACEMENT/g' FILE...
+;;
+;; ## The pattern is literal, not a regular expression
+;;
+;; This is the same boundary org-ieee-grep ships with, and it is named for the
+;; same reason: `string-index-of` finds a literal needle and there is no
+;; regular expression engine to call. So `s/^/>/` inserts nothing here, where
+;; sed anchors and prefixes every line -- measured 2026-09-10. Any script
+;; whose pattern contains a metacharacter means something different to the two
+;; implementations, and the test compares only literal ones.
+;;
+;; ## What IS matched, measured 2026-09-10
+;;
+;;   s/X/-/    the FIRST occurrence on each line, not every one
+;;   s/X/-/g   every occurrence, scanning on AFTER each replacement, so a
+;;             replacement containing the pattern does not loop
+;;   s/zz/-/   no occurrence leaves the line exactly as it was
+;;   s/X//     an empty replacement deletes
+;;   s|X|-|    the delimiter is whatever follows the `s`, not always `/`
+;;
+;; A last line with no trailing newline keeps none: sed preserves its input's
+;; termination rather than adding one.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37),
+;; :io/write-error (39).
+(ns sed.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn exists? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- the script ----------------------------------------------------------
+;; `s<D>PATTERN<D>REPLACEMENT<D>FLAGS`, where D is whatever byte follows the
+;; `s`. There are no escapes: a pattern containing the delimiter cannot be
+;; written, and the README says so rather than half-implementing `\/`.
+(defn script [] :string (arg "0"))
+
+(defn delim [] :string
+  (string-substring (script) 1 2))
+
+(defn after-s [] :string
+  (string-substring (script) 2 (string-byte-length (script))))
+
+(defn pattern [] :string
+  (let [r (after-s)
+        i (string-index-of r (delim))]
+    (if (< i 0) r (string-substring r 0 i))))
+
+(defn after-pattern [] :string
+  (let [r (after-s)
+        i (string-index-of r (delim))]
+    (if (< i 0) "" (string-substring r (+ i 1) (string-byte-length r)))))
+
+(defn replacement [] :string
+  (let [r (after-pattern)
+        i (string-index-of r (delim))]
+    (if (< i 0) r (string-substring r 0 i))))
+
+(defn flags [] :string
+  (let [r (after-pattern)
+        i (string-index-of r (delim))]
+    (if (< i 0) "" (string-substring r (+ i 1) (string-byte-length r)))))
+
+(defn global? [] :i64
+  (if (>= (string-index-of (flags) "g") 0) 1 0))
+
+;; A script must be `s`, a delimiter, and at least the two more delimiters
+;; that close the pattern and the replacement.
+(defn well-formed? [] :bool
+  (if (< (string-byte-length (script)) 3)
+    false
+    (if (string=? (string-substring (script) 0 1) "s")
+      (if (< (string-index-of (after-s) (delim)) 0)
+        false
+        (>= (string-index-of (after-pattern) (delim)) 0))
+      false)))
+
+;; --- substitution --------------------------------------------------------
+;; The scan continues AFTER the replacement, not from the start of it, so
+;; `s/a/aa/g` terminates. Measured against /usr/bin/sed.
+(defn subst-all [rest :string pat :string rep :string acc :string] :string
+  (let [i (string-index-of rest pat)]
+    (if (< i 0)
+      (string-concat acc rest)
+      (subst-all (string-substring rest (+ i (string-byte-length pat))
+                                   (string-byte-length rest))
+                 pat rep
+                 (string-concat (string-concat acc (string-substring rest 0 i))
+                                rep)))))
+
+(defn subst-first [line :string pat :string rep :string] :string
+  (let [i (string-index-of line pat)]
+    (if (< i 0)
+      line
+      (string-concat
+        (string-concat (string-substring line 0 i) rep)
+        (string-substring line (+ i (string-byte-length pat))
+                          (string-byte-length line))))))
+
+(defn apply-sub [line :string pat :string rep :string g? :i64] :string
+  (if (= g? 1) (subst-all line pat rep "") (subst-first line pat rep)))
+
+;; --- the line walk -------------------------------------------------------
+;; A last line with NO trailing newline keeps none -- unless another LINE
+;; follows it somewhere in the remaining input, in which case sed terminates
+;; it. `close?` carries that decision, which the caller makes.
+(defn walk [rest :string pat :string rep :string g? :i64 close? :i64] :i64
+  (let [i (string-index-of rest "\n")]
+    (if (< i 0)
+      (if (= (string-byte-length rest) 0)
+        0
+        (do (emit (apply-sub rest pat rep g?))
+            (if (= close? 1) (emit (nl)) "")
+            0))
+      (do
+        (emit (apply-sub (string-substring rest 0 i) pat rep g?))
+        (emit (nl))
+        (walk (string-substring rest (+ i 1) (string-byte-length rest))
+              pat rep g? close?)))))
+
+(defn complain [path :string] :i64
+  (do
+    (emit-error "sed: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; Does any operand from J onwards actually contribute a LINE? Not "is there
+;; another operand" -- measured 2026-09-10, sed leaves an unterminated last
+;; line unterminated when the operands after it are missing OR empty, and
+;; terminates it only when a real line follows:
+;;
+;;   sed s/X/-/ nonl plain   -> a-b\na-bXc...   terminated
+;;   sed s/X/-/ nonl nope    -> a-b              not
+;;   sed s/X/-/ nonl empty   -> a-b              not
+;;
+;; So sed reads its operands as ONE stream of lines and only the very last
+;; line of the whole input keeps a missing terminator. cut answers this
+;; differently (it preserves each operand's own termination) and sort
+;; differently again (it terminates every operand before appending the next).
+;; Three utilities, three answers, each measured rather than carried across.
+(defn more-lines-after? [j :i64 total :string] :bool
+  (if (string=? (decimal-of j) total)
+    false
+    (let [p (arg (decimal-of j))]
+      (if (exists? p)
+        (if (> (string-byte-length (slurp-file p)) 0)
+          true
+          (more-lines-after? (+ j 1) total))
+        (more-lines-after? (+ j 1) total)))))
+
+;; The script is re-derived per operand rather than carried, which keeps this
+;; walk at two parameters -- the compiler admits five and the alternative was
+;; index, total, pattern, replacement and the g flag.
+;;
+;; The lookahead only runs when this operand actually ends without a newline,
+;; so the extra reads it costs are paid only by inputs that need the answer.
+(defn each [i :i64 total :string] :i64
+  (if (string=? (decimal-of i) total)
+    0
+    (let [path (arg (decimal-of i))]
+      (if (exists? path)
+        (let [text (slurp-file path)
+              n (string-byte-length text)
+              open? (if (= n 0)
+                      false
+                      (if (string=? (string-substring text (- n 1) n) (nl))
+                        false
+                        true))
+              close? (if open?
+                       (if (more-lines-after? (+ i 1) total) 1 0)
+                       0)]
+          (do (walk text (pattern) (replacement) (global?) close?)
+              (each (+ i 1) total)))
+        (do (complain path) (each (+ i 1) total) 1)))))
+
+(defn main [] :i64
+  (let [total (arg "")]
+    (if (string=? total "1")
+      ;; A script and no file. POSIX reads standard input; there is no stdin
+      ;; capability, so this refuses rather than pretending to have read an
+      ;; empty one.
+      1
+      (if (well-formed? )
+        (if (= (string-byte-length (pattern)) 0)
+          ;; Measured: sed refuses an empty pattern rather than matching
+          ;; every position.
+          (do (emit-error "sed: first RE may not be empty")
+              (emit-error (nl))
+              1)
+          (each 1 total))
+        (do (emit-error "sed: unsupported script")
+            (emit-error (nl))
+            1)))))
