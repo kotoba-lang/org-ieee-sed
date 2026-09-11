@@ -1,4 +1,4 @@
-;; test/sed_test.cljs -- build the command and compare it with the system sed,
+;; test/sed_test.cljk -- build the command and compare it with the system sed,
 ;; byte for byte, on stdout, stderr AND exit status.
 ;;
 ;; Every script here uses a LITERAL pattern. That is not a convenience: this
