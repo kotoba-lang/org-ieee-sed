@@ -3,6 +3,13 @@
 ;;
 ;;   sed 's/PATTERN/REPLACEMENT/' FILE...
 ;;   sed 's/PATTERN/REPLACEMENT/g' FILE...
+;;   ... | sed 's/PATTERN/REPLACEMENT/[g]'   the same over standard input
+;;                                          (wire 41, 2026-09-16: 52% of
+;;                                          sed's 12,267 invocations in agent
+;;                                          tool use are a later pipeline
+;;                                          segment, 6,355 -- whole-input
+;;                                          form; input past the string pool
+;;                                          is refused, never edited short)
 ;;
 ;; ## The pattern is literal, not a regular expression
 ;;
@@ -96,13 +103,23 @@ b" 1 2))
 
 ;; A script must be `s`, a delimiter, and at least the two more delimiters
 ;; that close the pattern and the replacement.
+;; The flags are "" or "g" and nothing else. A stray letter used to pass
+;; (`s/X/-/q` substituted as if unflagged) where /usr/bin/sed refuses with
+;; `bad flag in substitute command` -- measured 2026-09-16 when the stdin
+;; cases were added. The system message names the script and the flag; this
+;; refuses with the generic "unsupported script", which the README lists.
+(defn flags-ok? [] :bool
+  (if (string=? (flags) "") true (string=? (flags) "g")))
+
 (defn well-formed? [] :bool
   (if (< (string-byte-length (script)) 3)
     false
     (if (string=? (string-substring (script) 0 1) "s")
       (if (< (string-index-of (after-s) (delim)) 0)
         false
-        (>= (string-index-of (after-pattern) (delim)) 0))
+        (if (>= (string-index-of (after-pattern) (delim)) 0)
+          (flags-ok?)
+          false))
       false)))
 
 ;; --- substitution --------------------------------------------------------
@@ -205,13 +222,24 @@ b" 1 2))
               (each (+ i 1) total)))
         (do (complain path) (each (+ i 1) total) 1)))))
 
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
 (defn main [] :i64
   (let [total (arg "")]
     (if (string=? total "1")
-      ;; A script and no file. POSIX reads standard input; there is no stdin
-      ;; capability, so this refuses rather than pretending to have read an
-      ;; empty one.
-      1
+      ;; A script and no file: standard input, whole. A single input, so a
+      ;; missing final newline stays missing (close? 0), as /usr/bin/sed
+      ;; answers `nonl` for `printf nonl | sed s/X/-/` -- measured.
+      (if (well-formed? )
+        (if (= (string-byte-length (pattern)) 0)
+          (do (emit-error "sed: first RE may not be empty")
+              (emit-error (nl))
+              1)
+          (walk (stdin "") (pattern) (replacement) (global?) 0))
+        (do (emit-error "sed: unsupported script")
+            (emit-error (nl))
+            1))
       (if (well-formed? )
         (if (= (string-byte-length (pattern)) 0)
           ;; Measured: sed refuses an empty pattern rather than matching
