@@ -14,7 +14,7 @@
 
 (defn- run [cmd args opts]
   (let [r (.spawnSync cp cmd (clj->js args)
-                      (clj->js (merge {:encoding "buffer"} opts)))]
+                      (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
     {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
 
 (defn- refuse [message]
@@ -90,7 +90,28 @@
    ;; A two-character pattern over four repeats: `aa` twice, not `aa` then a
    ;; leftover. This is the case that pins the scan advancing PAST the match
    ;; rather than by one byte.
-   ["s/aa/X/g" "runs"] ["s/aa/X/" "runs"] ["s/aa/aab/g" "runs"]])
+   ["s/aa/X/g" "runs"] ["s/aa/X/" "runs"] ["s/aa/aab/g" "runs"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 52% of sed's invocations in agent tool use are a later pipeline
+   ;; segment (6,355 of 12,267 measured); `grep | sed` alone is 1,163.
+   {:argv ["s/X/-/"] :stdin "plain"}
+   {:argv ["s/X/-/g"] :stdin "plain"}
+   {:argv ["s/X/-/g"] :stdin "twice"}
+   {:argv ["s/X/-/"] :stdin "nonl"}
+   {:argv ["s/X/-/"] :stdin "empty"}
+   {:argv ["s/日/Z/"] :stdin "utf8"}
+   {:argv ["s/aa/aab/g"] :stdin "runs"}
+   {:argv ["s//-/"] :stdin "plain"}])
+
+;; A behaviour this deliberately does NOT share byte for byte: a bad
+;; substitute flag. /usr/bin/sed names the script and the flag (`sed: 1:
+;; "s/X/-/q\n": bad flag in substitute command: 'q'`); this refuses with its
+;; generic "unsupported script", exit 1 -- the same exit, nothing on stdout.
+;; Written out rather than compared, and here because until 2026-09-16 the
+;; flag was not checked at all and `s/X/-/q` substituted as if unflagged.
+(def divergences
+  [{:argv ["s/X/-/q"] :stdin "plain" :out "" :err "sed: unsupported script\n" :exit 1}
+   {:argv ["s/X/-/gg"] :stdin "plain" :out "" :err "sed: unsupported script\n" :exit 1}])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -110,7 +131,7 @@
         exe (.join path tmp "sed")
         data (.join path tmp "data")]
     (.writeFileSync fs policy
-                    "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
+                    "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
     (.mkdirSync fs data)
     (doseq [[name content] fixtures]
       (.writeFileSync fs (.join path data name) content "utf8"))
@@ -124,7 +145,7 @@
           offset (second (re-find #":offset (\d+)" report))]
       (when-not offset (refuse (str "no :offset in the extract report: " report)))
       (let [p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
-                          "--allow" "35,37,38,39"
+                          "--allow" "35,37,38,39,41"
                           "--fs-scope" (.realpathSync fs data)
                           "--string-pool" "4000000" "--fuel" "50000000"
                           "--pairs" "200000" "--output" exe] {})]
@@ -132,18 +153,37 @@
 
     (let [real (.realpathSync fs data)
           results
-          (for [names cases]
+          (for [case cases]
             ;; The first element is the SCRIPT and every one after it a path.
-            (let [argv (into [(first names)]
+            ;; A map case {:argv [SCRIPT] :stdin FIXTURE} feeds the fixture as
+            ;; standard input to BOTH binaries (a Buffer: spawnSync applies
+            ;; :encoding "buffer" to a string input and node refuses it).
+            (let [names (if (map? case) (:argv case) case)
+                  input (when (map? case)
+                          (let [v (get fixtures (:stdin case))]
+                            (if (string? v) v (refuse (str "no fixture " (:stdin case))))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  argv (into [(first names)]
                              (mapv #(.join path real %) (rest names)))
-                  k (run exe argv {})
-                  s (run system-sed argv {})
+                  k (run exe argv opts)
+                  s (run system-sed argv opts)
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
                              (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
                              (= (:status k) (:status s)))]
-              {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+               :ok same? :kotoba (.toString (:out k) "utf8")
                :system (.toString (:out s) "utf8")
                :exit [(:status k) (:status s)]}))
+          div-results
+          (for [d divergences]
+            (let [k (run exe (:argv d) {:input (js/Buffer.from (get fixtures (:stdin d)) "utf8")})
+                  ok? (and (= (.toString (:out k) "utf8") (:out d))
+                           (= (.toString (:err k) "utf8") (:err d))
+                           (= (:status k) (:exit d)))]
+              {:argv [(:argv d) :divergence] :ok ok? :kotoba (.toString (:out k) "utf8")
+               :system (str "(not compared; expected stderr " (pr-str (:err d)) ")")
+               :exit [(:status k) (:exit d)]}))
+          results (concat results div-results)
           bad (remove :ok results)]
       (doseq [r results]
         (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r))
