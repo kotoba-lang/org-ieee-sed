@@ -1,113 +1,121 @@
-# kotoba-lang/org-ieee-sed — POSIX `sed`, the substitute command
+# kotoba-lang/org-ieee-sed — POSIX `sed`: `s`, `p`, `d`, addresses, regular expressions
 
-The `s` command from IEEE Std 1003.1, with **literal** patterns, written in
-`.kotoba` and compiled to a standalone native executable.
+IEEE Std 1003.1 `sed`, written in `.kotoba`, compiled to a standalone native
+executable, linked with [`org-ieee-regex`](https://github.com/kotoba-lang/org-ieee-regex)
+for the regular expressions.
 
 ```sh
-./sed 's/PATTERN/REPLACEMENT/'  FILE...
-./sed 's/PATTERN/REPLACEMENT/g' FILE...
+./sed 's/RE/REPLACEMENT/[g][p]' [FILE...]
+./sed -n '/RE/,/RE/p'           [FILE...]
+./sed -n '12,40p'               [FILE...]
+./sed '/RE/d'                   [FILE...]
+./sed -E 's/(a|b)+/X/g'         [FILE...]
+... | ./sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 ```
 
-Thirty-two cases agree with `/usr/bin/sed` on stdout, stderr and exit status.
+146 cases agree with `/usr/bin/sed` on stdout, stderr and exit status; six
+named divergences are written out in the suite rather than compared.
 
-## The pattern is literal, not a regular expression
+## Which scripts, measured 2026-09-17
 
-The same boundary [`org-ieee-grep`](https://github.com/kotoba-lang/org-ieee-grep)
-ships with, named for the same reason: `string-index-of` finds a literal
-needle and there is no regular expression engine to call. So `s/^/>/` inserts
-nothing here, where sed anchors and prefixes every line.
+Of 1,268,018 agent Bash calls, 15,968 are `sed` with a single-quoted script.
+By shape:
 
-Any script whose pattern holds a metacharacter means something different to
-the two implementations, so the suite compares only literal ones — comparing
-the rest would be comparing two different questions.
+| shape | count | here |
+|---|---|---|
+| `-n 'N,Mp'` (and several joined by `;`) | 8,762 + 205 | yes |
+| `s` with a metacharacter (`s/^+//`, `s/[[:space:]]*$//`, …) | 3,217 | yes |
+| … with `g`, with `-E`, joined by `;` | 139, 102, ~380 | yes |
+| `-i` (in place) | 1,042 | no — it writes the file |
+| `-n '/re/,/re/p'`, `/re/p`, `,+N` | 817 + 59 | yes |
+| `\1` in the replacement | 193 + 105 + 89 | **no** — refused by name |
+| `s` literal | 345 + 57 | yes |
+| `/re/d` | 109 | yes |
+| `-n 's/…/…/p'` | 113 | yes |
 
-There are also no escapes: a pattern containing the delimiter cannot be
-written. The delimiter is whatever byte follows the `s`, so `s|X|-|` works.
-
-## What is matched, measured 2026-09-10
-
-```
-s/X/-/    the FIRST occurrence on each line, not every one
-s/X/-/g   every occurrence
-s/zz/-/   no occurrence leaves the line exactly as it was
-s/X//     an empty replacement deletes
-s//-/     an EMPTY pattern is refused, not treated as matching everywhere
-```
-
-Under `g` the scan continues **after** each replacement, not from the start of
-it, so `s/a/aa/g` terminates rather than looping.
-
-### A control that passed, which meant the suite was weaker than it looked
-
-Breaking that scan — advancing one byte instead of past the match — passed
-**all 29** cases the suite had at the time. Every pattern in it was one byte
-long, which makes those two rules the same thing.
-
-The fixture that separates them is a two-character pattern over four repeats:
-`s/aa/X/g` over `aaaa` is `XX`, and advancing by one byte gives `XXXa`. With
-that case present the same control fails exactly the two `g` cases, as it
-should have all along.
-
-## The unterminated last line: three utilities, three answers
-
-An unterminated last line is closed only when another **line** follows it
-somewhere in the remaining input — not merely another operand:
+## Semantics, each measured on `/usr/bin/sed`
 
 ```
-sed s/X/-/ nonl plain   ->  a-b\na-bXc…    terminated
-sed s/X/-/ nonl nope    ->  a-b            not: the follower is missing
-sed s/X/-/ nonl empty   ->  a-b            not: the follower has no lines
+s/X/-/       the FIRST match on each line; g every match, scanning on
+             AFTER each replacement (so s/a/aa/g terminates)
+s/x*/-/g     -a-b-c- over abc: an empty match at every position
+s/b*/-/g     -a-c-: an empty match right after a match is skipped
+s/^a/X/g     Xaa over aaa: ^ is the line start, not the scan start
+&  \&  \n \t the match, a literal &, a newline, a tab, in the replacement
+s/a\/b/X/    \ before the delimiter is the delimiter itself
+\x1b         a byte by hex (the ANSI-escape stripper agents write)
+\t           a tab, in the pattern too
+s//-/        an EMPTY pattern is refused: "first RE may not be empty"
+s/X/-/p      prints the line when it substituted (twice without -n)
+/A/,/B/p     from a line matching A through the next matching B, the end
+             tested from the NEXT line (/A/,/A/ spans two lines); ranges
+             restart after they end
+/A/,3p       through line 3; an end at or before the start is ONE line
+/A/,+2p      the start and two more lines
+2,/B/p       from line 2 through the next B
+0,2p         nothing (lines begin at 1); $ is the last line
+1,2p;2,3p    a line prints once PER command selecting it
+/A/d         deletes: no later command sees the line, no autoprint
+without -n   every line once, plus once per p
+no newline   a last line without one keeps none, on EVERY print of it
+             (printf a | sed p is aa)
+several files ONE stream: line numbers continue, and a file lacking a
+             final newline gets one only when another LINE follows
+a^b  a$b  *b BRE: ^ $ * are literal where they cannot anchor or repeat
 ```
 
-So sed reads its operands as one stream of lines and only the very last line
-of the whole input keeps a missing terminator.
-[`org-ieee-cut`](https://github.com/kotoba-lang/org-ieee-cut) answers this
-differently — it preserves each operand's own termination — and
-[`org-ieee-sort`](https://github.com/kotoba-lang/org-ieee-sort) differently
-again, terminating every operand before appending the next. Each was measured
-on its own utility rather than carried across from a sibling.
+### Named divergences (in the suite as `divergences`, not compared)
 
-The lookahead that decides this runs only when an operand actually ends
-without a newline, so the extra reads are paid by the inputs that need the
-answer.
+- `\1`..`\9` in the replacement: `sed: unsupported script: \N back-reference`,
+  exit 1. The engine keeps no capture groups. 387 measured uses — the
+  largest thing this does not do.
+- A bad pattern: exit 1 and the shape `sed: 1: "SCRIPT\n": RE error: …`
+  are `/usr/bin/sed`'s; the message after `RE error:` is the engine's.
+- BRE `\+` and `\|`: one-or-more and alternation here, as `/usr/bin/grep`
+  reads them (the engine is shared); `/usr/bin/sed` reads a literal `+`
+  and `|`. 17 + 31 measured scripts use them, every one written for the
+  GNU meaning and silently a no-op on macOS.
+- Two `+N` addresses in one script: refused (one countdown is kept).
+- A bad substitute flag or command letter: `sed: unsupported script`,
+  exit 1, where `/usr/bin/sed` names the flag or letter.
+
+## What this is not
+
+No `-i`, `y`, `a`, `i`, `c`, `q`, `{}`, `w`, `N`, hold space, `I` flag,
+`//` (the last RE), numeric substitute flag (`s/a/b/2`), more than 40
+commands in one script (one bit per command carries range state). Each of
+these is refused, exit 1, never half-done.
+
+## How
+
+The script is parsed ONCE into length-prefixed fields (`LEN:bytes`, eight
+per command: addr1 type, value, addr2 type, value, command, pattern,
+replacement template, flags) — no separator byte, so any bytes fit. A
+pattern with a metacharacter is a regex.core program plus its literal
+prefilter (the runs one of which every matching line must hold; a host
+search skips the rest before the simulation); a pattern without one keeps
+the literal walk (one host search per occurrence). Each line runs its
+cycle inside an `arena-scope`, so a file's walk never accumulates; what
+crosses lines is one i64: bit k = "command k's range is active", bits 40+
+the `+N` countdown. `d` carries the untouched bits of the commands after it.
+
+Measured 2026-09-17 on a 5.6 MB, 769,400-line file (user time, this /
+`/usr/bin/sed`): `-n '/^\.\.\./,/^:/p'` 0.84 s / 0.21 s (3.69 s before the
+prefilter); `s/foo/bar/g` 1.25 s / 0.26 s; `-n 100,200p` 0.61 s / 0.13 s.
+The per-line cycle (field decoding, the region) is the floor; the measured
+inputs are pipeline tails of a few hundred lines, where the process start
+is what counts.
 
 ## Capabilities
 
 `:cli/args` (38), `:fs/app-data` (35), `:io/write` (37), `:io/write-error`
-(39). A missing operand is reported byte-for-byte and the readable ones are
-still written, exit 1.
+(39), `:io/read` (41). A missing operand is reported byte-for-byte and the
+readable ones are still written, exit 1. With a script and no file operand
+`sed` reads standard input, whole; input larger than the binary's string
+pool is refused (exit 120), never edited short.
 
-## What this is not
+## Test
 
-Only `s`. No addresses (`1,3s/…`), no `-n`, `-e`, `-i`, `-E`, no `p`/`d`/`y`
-commands, no `&` or `\1` in the replacement, no regular expressions. A bad
-substitute flag (`s/X/-/q`, `s/X/-/gg`) is refused with the generic
-`sed: unsupported script`, exit 1, where `/usr/bin/sed` names the script and
-the flag — a named divergence in the suite (until 2026-09-16 the flag was not
-checked at all).
-
-## `-n 'N,Mp'` — print by line address
-
-Measured 2026-09-17 over 1,268,018 agent Bash calls: `sed -n` is 14,786 of
-them and at least 12,700 are `N,Mp`, `Np`, `N,$p`, or several joined by `;`
-— agents read a window of a file by line number, and no regular expression
-is involved. So `p` with numeric addresses is the second script family
-here, beside the literal `s`: `sed -n '2,3p'`, `'4,$p'`, `'$p'`, `'2p;4p'`,
-`'1, 3p'`, and bare `p`; without `-n` every line prints once plus once per
-command selecting it. Each semantics was measured on `/usr/bin/sed` and is
-compared in the suite: a line prints once *per command* (`1,2p;2,3p` prints
-line 2 twice), an end before the start prints the start line alone
-(`3,2p`), `0,2p` prints nothing, `$` is the last line and a missing final
-newline stays missing, and several operands are *one stream* — line
-numbers continue, and a file lacking a final newline gets one when another
-file follows. Any other command letter (`x`, `d`, …) is refused with
-`sed: unsupported script`. 32 cases added, 73 compared in all.
-
-## Standard input
-
-With a script and no file operand `sed` reads standard input (wire 41
-`:io/read`, 2026-09-16) — 52% of how it is invoked in agent tool use (6,355
-of 12,267 over 1,268,018 measured Bash calls; `grep | sed` alone is 1,163).
-A single input, so a missing final newline stays missing, as `/usr/bin/sed`
-does. Whole-input form: input larger than the binary's string pool is
-refused (exit 120), never edited short.
+```sh
+AMU_HOME=../amu REGEX_HOME=../org-ieee-regex kbb --backend sci test/sed_test.cljk
+```
