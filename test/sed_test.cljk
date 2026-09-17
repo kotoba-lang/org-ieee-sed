@@ -28,6 +28,12 @@
 
 (def system-sed "/usr/bin/sed")
 
+;; The regex engine this links: org-ieee-regex, a sibling checkout by default.
+(def regex-home
+  (or (.-REGEX_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." "org-ieee-regex")]
+        (when (.existsSync fs (.join path guess "regex" "core.kotoba")) guess))))
+
 (def fixtures
   {"plain"  "aXbXc\nnope\nXstart\n"
    "five"   "1\n2\n3\n4\n5"
@@ -48,7 +54,23 @@
    ;; one byte, which makes "advance past the match" and "advance one byte"
    ;; the same thing -- so without this the scan-advance is untested, and a
    ;; control that broke it passed all 29 other cases.
-   "runs"   "aaaa\n"})
+   "runs"   "aaaa\n"
+   ;; --- regular expressions and addresses (2026-09-17) ---
+   "text"   "alpha 1\nbeta 22\n## A\nx\n## B\ny\n## A\nz\n"
+   "abc"    "abc\n"
+   "aaa"    "aaa\n"
+   "ab"     "ab\n"
+   "slash"  "a/b\nc\n"
+   "ansi"   "a\u001b[31mb\n"
+   "pad"    "  ab  \n"
+   "words"  "foo bar\n"
+   "abab"   "A\nB\nA\nB\nA\n"
+   "six"    "1\n2\n3\n4\n5\n6\n"
+   "tab"    "a\tb\n"
+   "html"   "<b>x</b> y\n"
+   "key"    "sk_live_abcdef123 x\n"
+   "diff"   "+added\n-removed\n+\n"
+   "uni"    "h\u00e9llo \u65e5\u672c\n"})
 
 (def cases
   [["s/X/-/" "plain"] ["s/X/-/g" "plain"]
@@ -114,7 +136,37 @@
    ["-n" "1p" "two" "five"] ["-n" "2,3p" "missing"] ["-n" "2,3p" "five" "missing"] ["-n" "6p" "five" "missing" "two"]
    ["2,3p" "two"] ["2p;2p" "five"] ["-n" "$p" "empty"] ["-n" "1,3p" "empty"] ["-n" "2p" "nonl"]
    {:argv ["-n" "2,3p"] :stdin "five"} {:argv ["-n" "$p"] :stdin "plain"} {:argv ["-n" "1,2p;2,3p"] :stdin "five"}
-   {:argv ["2,3p"] :stdin "two"} {:argv ["-n" "1,200p"] :stdin "plain"}])
+   {:argv ["2,3p"] :stdin "two"} {:argv ["-n" "1,200p"] :stdin "plain"}
+   ;; --- regular expressions, /re/ addresses, d, p flag (2026-09-17) ---------
+   ;; Measured over 15,968 single-quoted agent sed scripts: `s` with a
+   ;; metacharacter 3,217 (+139 g, +102 -E, ~380 joined by `;`), `-n
+   ;; '/re/,/re/p'` 817, `/re/p` 59, `/re/d` 109, `-n 's/../p'` 113.
+   ;; Each semantics measured on /usr/bin/sed and compared here.
+   {:argv ["s/x*/-/g"] :stdin "abc"} {:argv ["s/b*/-/g"] :stdin "abc"} {:argv ["s/b*/-/"] :stdin "abc"}
+   {:argv ["s/^a/X/g"] :stdin "aaa"} {:argv ["s/a$/X/g"] :stdin "aaa"} {:argv ["s/./-/g"] :stdin "uni"}
+   {:argv ["s/b/[&]\\&/"] :stdin "ab"} {:argv ["s/a\\/b/X/"] :stdin "slash"} {:argv ["s|a/b|X|"] :stdin "slash"}
+   {:argv ["-E" "s/foo|bar/X/g"] :stdin "words"} {:argv ["s/foo|bar/X/g"] :stdin "words"}
+   {:argv ["s/\\x1b\\[[0-9;]*m//g"] :stdin "ansi"} {:argv ["s/^[[:space:]]*//;s/[[:space:]]*$//"] :stdin "pad"}
+   {:argv ["s/a/1/; s/b/2/"] :stdin "ab"} {:argv ["s/,/\\n/"] :stdin "abc"} {:argv ["s/b/\\n/"] :stdin "abc"}
+   {:argv ["s/\\t/T/"] :stdin "tab"} {:argv ["s/a/\\t/"] :stdin "ab"} {:argv ["-n" "/\\t/p"] :stdin "tab"}
+   {:argv ["s/<[^>]*>/ /g"] :stdin "html"} {:argv ["-E" "s/(sk_live_|sk_test_)[A-Za-z0-9_]+/<R>/g"] :stdin "key"}
+   {:argv ["s/^+//"] :stdin "diff"} {:argv ["/^-/d"] :stdin "diff"} {:argv ["-n" "/^+/p"] :stdin "diff"}
+   {:argv ["s//-/"] :stdin "abc"} {:argv ["-n" "//p"] :stdin "abc"}
+   {:argv ["-n" "s/a/X/gp"] :stdin "aaa"} {:argv ["s/a/b/p"] :stdin "ab"} {:argv ["-n" "s/z/b/p"] :stdin "ab"}
+   {:argv ["-n" "s/^[a-z]* \\([0-9]*\\)$/N/p"] :stdin "text"}
+   {:argv ["2s/a/X/"] :stdin "text"} {:argv ["/beta/s/a/X/g"] :stdin "text"} {:argv ["$d"] :stdin "text"}
+   {:argv ["-n" "/## A/,/## B/p"] :stdin "text"} {:argv ["-n" "/## A/,+1p"] :stdin "text"} {:argv ["-n" "2,/## B/p"] :stdin "text"}
+   {:argv ["-n" "/## A/,2p"] :stdin "text"} {:argv ["/^## /d"] :stdin "text"} {:argv ["-n" "/A/,/A/p"] :stdin "abab"}
+   {:argv ["-n" "/A/,/B/p"] :stdin "abab"} {:argv ["/A/,/B/s/^/> /"] :stdin "abab"} {:argv ["/A/,/B/d"] :stdin "abab"}
+   {:argv ["-n" "/1/p;/1/d;p"] :stdin "six"} {:argv ["/1/d;s/1/X/"] :stdin "six"} {:argv ["-n" "/2/,+2p"] :stdin "six"}
+   {:argv ["-n" "/2/,+0p"] :stdin "six"} {:argv ["-n" "/5/,+9p"] :stdin "six"} {:argv ["-n" "0,/2/p"] :stdin "six"}
+   {:argv ["-n" "/3/,1p"] :stdin "six"} {:argv ["-n" "2d;p"] :stdin "six"} {:argv ["-n" "2,3d"] :stdin "five"}
+   {:argv ["-n" "$p;1p"] :stdin "six"} {:argv ["-n" "/a\\/b/p"] :stdin "slash"}
+   {:argv ["-E" "-n" "/^ab+$/p"] :stdin "ab"} {:argv ["-nE" "/b+/p"] :stdin "ab"} {:argv ["-En" "/b+/p"] :stdin "ab"}
+   {:argv ["-e" "s/a/1/"] :stdin "ab"} {:argv ["s/*b/X/"] :stdin "abc"} {:argv ["s/a^b/X/"] :stdin "abc"}
+   {:argv ["s/X/-/"] :stdin "nonl"} {:argv ["p"] :stdin "nonl"} {:argv ["-n" "s/X/-/p"] :stdin "nonl"}
+   ["-n" "/X/p" "plain" "nonl"] ["/X/d" "plain" "two"] ["s/^/> /" "nonl" "empty" "plain"]
+   ["-n" "/a/,/b/p" "two" "five"] ["s/[0-9]/N/g" "five" "missing" "two"]])
 
 ;; A behaviour this deliberately does NOT share byte for byte: a bad
 ;; substitute flag. /usr/bin/sed names the script and the flag (`sed: 1:
@@ -127,7 +179,21 @@
    {:argv ["s/X/-/gg"] :stdin "plain" :out "" :err "sed: unsupported script\n" :exit 1}
    ;; Another command letter is refused, where /usr/bin/sed would run it.
    {:argv ["-n" "2,3x"] :stdin "five" :out "" :err "sed: unsupported script\n" :exit 1}
-   {:argv ["-n" "2,3d"] :stdin "five" :out "" :err "sed: unsupported script\n" :exit 1}])
+   ;; `\1` needs a capture group and the engine keeps none: refused by name,
+   ;; exit 1, where /usr/bin/sed substitutes. 193 + 105 + 89 measured uses.
+   {:argv ["s/\\(a\\)/\\1\\1/"] :stdin "ab" :out "" :err "sed: unsupported script: \\N back-reference\n" :exit 1}
+   ;; A bad pattern: the exit and the shape are /usr/bin/sed's, the message
+   ;; after `RE error:` is the engine's own.
+   {:argv ["s/a\\{/b/"] :stdin "ab" :out "" :err "sed: 1: \"s/a\\{/b/\\n\": RE error: braces { } not balanced\n" :exit 1}
+   ;; Two `+N` ranges: one countdown is kept.
+   {:argv ["-n" "/1/,+1p;/4/,+0p"] :stdin "six" :out "" :err "sed: unsupported script: two +N addresses\n" :exit 1}
+   ;; BRE `\+` is one-or-more here, as /usr/bin/grep reads it; /usr/bin/sed
+   ;; reads a literal `+` (17 measured uses, every one written for the GNU
+   ;; meaning and silently a no-op on macOS).
+   {:argv ["s/a\\+/X/"] :stdin "aaa" :out "X\n" :err "" :exit 0}
+   ;; Likewise BRE `\|`: alternation here and in /usr/bin/grep, a literal
+   ;; `|` in /usr/bin/sed (the measured `/A\|B\|C/,+18p` wants alternation).
+   {:argv ["s/foo\\|bar/X/g"] :stdin "words" :out "X X\n" :err "" :exit 0}])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -151,7 +217,9 @@
     (.mkdirSync fs data)
     (doseq [[name content] fixtures]
       (.writeFileSync fs (.join path data name) content "utf8"))
-    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+    (when-not regex-home (refuse "set REGEX_HOME to an org-ieee-regex checkout"))
+    (let [c (run "node" [amu "compile" src "--source-path" (.resolve path (.cwd js/process))
+                         "--source-path" regex-home "--target" "aarch64-macos" "--jvm-free"
                          "--policy" policy "--output" kexe] {})]
       (when (not= 0 (:status c))
         (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
@@ -179,9 +247,9 @@
                           (let [v (get fixtures (:stdin case))]
                             (if (string? v) v (refuse (str "no fixture " (:stdin case))))))
                   opts (if input {:input (js/Buffer.from input "utf8")} {})
-                  ;; `-n SCRIPT FILE...` or `SCRIPT FILE...`: the leading
-                  ;; -n and the script pass through, the rest are paths.
-                  nhead (if (= "-n" (first names)) 2 1)
+                  ;; `[-n|-E|-e]... SCRIPT FILE...`: the options and the
+                  ;; script pass through, the rest are paths.
+                  nhead (inc (count (take-while #(str/starts-with? % "-") names)))
                   argv (into (vec (take nhead names))
                              (mapv #(.join path real %) (drop nhead names)))
                   k (run exe argv opts)
