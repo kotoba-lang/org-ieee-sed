@@ -86,6 +86,23 @@ substitute flag (`s/X/-/q`, `s/X/-/gg`) is refused with the generic
 the flag — a named divergence in the suite (until 2026-09-16 the flag was not
 checked at all).
 
+## `-n 'N,Mp'` — print by line address
+
+Measured 2026-09-17 over 1,268,018 agent Bash calls: `sed -n` is 14,786 of
+them and at least 12,700 are `N,Mp`, `Np`, `N,$p`, or several joined by `;`
+— agents read a window of a file by line number, and no regular expression
+is involved. So `p` with numeric addresses is the second script family
+here, beside the literal `s`: `sed -n '2,3p'`, `'4,$p'`, `'$p'`, `'2p;4p'`,
+`'1, 3p'`, and bare `p`; without `-n` every line prints once plus once per
+command selecting it. Each semantics was measured on `/usr/bin/sed` and is
+compared in the suite: a line prints once *per command* (`1,2p;2,3p` prints
+line 2 twice), an end before the start prints the start line alone
+(`3,2p`), `0,2p` prints nothing, `$` is the last line and a missing final
+newline stays missing, and several operands are *one stream* — line
+numbers continue, and a file lacking a final newline gets one when another
+file follows. Any other command letter (`x`, `d`, …) is refused with
+`sed: unsupported script`. 32 cases added, 73 compared in all.
+
 ## Standard input
 
 With a script and no file operand `sed` reads standard input (wire 41

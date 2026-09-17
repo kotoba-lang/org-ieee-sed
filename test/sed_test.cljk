@@ -30,6 +30,8 @@
 
 (def fixtures
   {"plain"  "aXbXc\nnope\nXstart\n"
+   "five"   "1\n2\n3\n4\n5"
+   "two"    "a\nb\n"
    ;; Two occurrences on one line, so `g` and the default differ visibly.
    "twice"  "XX\n"
    ;; A replacement that CONTAINS the pattern, which is how a `g` that
@@ -101,7 +103,18 @@
    {:argv ["s/X/-/"] :stdin "empty"}
    {:argv ["s/日/Z/"] :stdin "utf8"}
    {:argv ["s/aa/aab/g"] :stdin "runs"}
-   {:argv ["s//-/"] :stdin "plain"}])
+   {:argv ["s//-/"] :stdin "plain"}
+   ;; --- -n with line addresses (2026-09-17) --------------------------------
+   ;; `sed -n 'N,Mp'` is at least 12,700 of the 14,786 measured `sed -n`
+   ;; calls. Each semantics measured on /usr/bin/sed and compared here.
+   ["-n" "2,3p" "five"] ["-n" "4,$p" "five"] ["-n" "$p" "five"] ["-n" "2p" "five"] ["-n" "1p" "five"]
+   ["-n" "2p;4p" "five"] ["-n" "1,2p;2,3p" "five"] ["-n" "3,2p" "five"] ["-n" "9,12p" "five"]
+   ["-n" "0,2p" "five"] ["-n" "1, 3p" "five"] ["-n" "2,3 p" "five"] ["-n" "2,3p; 5p" "five"]
+   ["-n" "p" "two"] ["-n" "1,$p" "two"] ["-n" "2,3p" "five" "two"] ["-n" "5,6p" "five" "two"]
+   ["-n" "1p" "two" "five"] ["-n" "2,3p" "missing"] ["-n" "2,3p" "five" "missing"] ["-n" "6p" "five" "missing" "two"]
+   ["2,3p" "two"] ["2p;2p" "five"] ["-n" "$p" "empty"] ["-n" "1,3p" "empty"] ["-n" "2p" "nonl"]
+   {:argv ["-n" "2,3p"] :stdin "five"} {:argv ["-n" "$p"] :stdin "plain"} {:argv ["-n" "1,2p;2,3p"] :stdin "five"}
+   {:argv ["2,3p"] :stdin "two"} {:argv ["-n" "1,200p"] :stdin "plain"}])
 
 ;; A behaviour this deliberately does NOT share byte for byte: a bad
 ;; substitute flag. /usr/bin/sed names the script and the flag (`sed: 1:
@@ -111,7 +124,10 @@
 ;; flag was not checked at all and `s/X/-/q` substituted as if unflagged.
 (def divergences
   [{:argv ["s/X/-/q"] :stdin "plain" :out "" :err "sed: unsupported script\n" :exit 1}
-   {:argv ["s/X/-/gg"] :stdin "plain" :out "" :err "sed: unsupported script\n" :exit 1}])
+   {:argv ["s/X/-/gg"] :stdin "plain" :out "" :err "sed: unsupported script\n" :exit 1}
+   ;; Another command letter is refused, where /usr/bin/sed would run it.
+   {:argv ["-n" "2,3x"] :stdin "five" :out "" :err "sed: unsupported script\n" :exit 1}
+   {:argv ["-n" "2,3d"] :stdin "five" :out "" :err "sed: unsupported script\n" :exit 1}])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -163,8 +179,11 @@
                           (let [v (get fixtures (:stdin case))]
                             (if (string? v) v (refuse (str "no fixture " (:stdin case))))))
                   opts (if input {:input (js/Buffer.from input "utf8")} {})
-                  argv (into [(first names)]
-                             (mapv #(.join path real %) (rest names)))
+                  ;; `-n SCRIPT FILE...` or `SCRIPT FILE...`: the leading
+                  ;; -n and the script pass through, the rest are paths.
+                  nhead (if (= "-n" (first names)) 2 1)
+                  argv (into (vec (take nhead names))
+                             (mapv #(.join path real %) (drop nhead names)))
                   k (run exe argv opts)
                   s (run system-sed argv opts)
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
