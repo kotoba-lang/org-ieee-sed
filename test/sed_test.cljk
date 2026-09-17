@@ -195,6 +195,35 @@
    ;; `|` in /usr/bin/sed (the measured `/A\|B\|C/,+18p` wants alternation).
    {:argv ["s/foo\\|bar/X/g"] :stdin "words" :out "X X\n" :err "" :exit 0}])
 
+;; --- in place (2026-09-17) --------------------------------------------------
+;; `sed -i ''` is 1,029 of the 15,968 measured scripts (`-i.bak` once).
+;; Each case runs in a FRESH copy of the fixtures, with the working
+;; directory inside it and the operands RELATIVE -- the way agents write
+;; them (99,826 relative to 17,104 absolute file operands measured), which
+;; the loader resolves against the start directory since amu #1023. Both
+;; binaries run the same argv; then stdout, stderr, the exit status and
+;; every fixture's bytes and mode are compared. Semantics measured on
+;; /usr/bin/sed: each operand is its own stream (`$` and line numbers
+;; restart), the mode is kept, nothing reaches stdout, a missing operand or
+;; a directory STOPS the run after the operands before it were edited,
+;; `-i` with no operand is refused, the argument after `-i` is the backup
+;; suffix (`sed -i 's/a/b/' f` takes the script as the suffix).
+(def in-place-cases
+  [["-i" "" "s/X/-/" "plain"] ["-i" "" "s/X/-/g" "plain" "twice"] ["-i" "" "s/X/-/" "nonl"]
+   ["-i" "" "s/X/-/" "utf8" "bare"] ["-i" "" "s/X/-/" "empty"] ["-i" "" "s/X/-/" "missing" "plain"]
+   ["-i" "" "s/X/-/" "plain" "missing" "twice"] ["-i" "" "s/X/-/" "plain" "dir" "twice"]
+   ["-n" "-i" "" "2p" "five"] ["-i" "" "-n" "$p" "five" "two"] ["-i" "" "/^#/d" "text"]
+   ["-i" "" "-e" "s/2/8/" "five"] ["-i.bak" "s/2/6/" "five"] ["-i" "" "s/X/-/" "./plain"]
+   ["-E" "-i" "" "s/[0-9]+/N/g" "five"] ["-i" "" "s/^/> /" "two" "nonl"]
+   ["-i" "" "s/x/y/"] ["-i" "" "1,2d" "text"] ["-i" "" "s/a/b/" "dir"]])
+
+;; `sed -i 's/1/9/' five` (no suffix argument) takes the script as the suffix
+;; and `five` as the script: both refuse, exit 1, /usr/bin/sed naming the
+;; command code and this saying "unsupported script" -- the generic message
+;; divergence above, so it is written out here rather than compared.
+(def in-place-divergences
+  [{:argv ["-i" "s/1/9/" "five"] :err "sed: unsupported script\n" :exit 1}])
+
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
       ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
@@ -230,7 +259,7 @@
       (when-not offset (refuse (str "no :offset in the extract report: " report)))
       (let [p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
                           "--allow" "35,37,38,39,41"
-                          "--fs-scope" (.realpathSync fs data)
+                          "--fs-scope" (.realpathSync fs tmp)
                           "--string-pool" "4000000" "--fuel" "50000000"
                           "--pairs" "200000" "--output" exe] {})]
         (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
@@ -270,7 +299,42 @@
               {:argv [(:argv d) :divergence] :ok ok? :kotoba (.toString (:out k) "utf8")
                :system (str "(not compared; expected stderr " (pr-str (:err d)) ")")
                :exit [(:status k) (:exit d)]}))
-          results (concat results div-results)
+          ;; Each in-place case: two fresh fixture trees, the same argv run
+          ;; with the working directory inside each, then everything compared.
+          in-place-results
+          (for [argv in-place-cases]
+            (let [tree (fn [tag]
+                         (let [d (.mkdtempSync fs (.join path tmp (str "inplace-" tag "-")))]
+                           (doseq [[name content] fixtures]
+                             (.writeFileSync fs (.join path d name) content "utf8"))
+                           (.chmodSync fs (.join path d "five") 0640)
+                           (.mkdirSync fs (.join path d "dir"))
+                           d))
+                  snapshot (fn [d]
+                             (into (sorted-map)
+                                   (for [n (.readdirSync fs d)]
+                                     (let [st (.statSync fs (.join path d n))]
+                                       [n (if (.isDirectory st) "<dir>"
+                                            [(.toString (.readFileSync fs (.join path d n)) "base64")
+                                             (bit-and (.-mode st) 0777)])]))))
+                  dk (tree "k") ds (tree "s")
+                  k (run exe argv {:cwd dk})
+                  s (run system-sed argv {:cwd ds})
+                  same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
+                             (= (:status k) (:status s))
+                             (= (snapshot dk) (snapshot ds)))]
+              {:argv (into [:in-place] argv) :ok same?
+               :kotoba (str (.toString (:err k) "utf8") (pr-str (snapshot dk)))
+               :system (str (.toString (:err s) "utf8") (pr-str (snapshot ds)))
+               :exit [(:status k) (:status s)]}))
+          in-place-div-results
+          (for [d in-place-divergences]
+            (let [k (run exe (:argv d) {:cwd tmp})
+                  ok? (and (= "" (.toString (:out k) "utf8")) (= (:err d) (.toString (:err k) "utf8")) (= (:exit d) (:status k)))]
+              {:argv (into [:in-place (:argv d)] [:divergence]) :ok ok? :kotoba (.toString (:err k) "utf8")
+               :system (str "(not compared; expected stderr " (pr-str (:err d)) ")") :exit [(:status k) (:exit d)]}))
+          results (concat results div-results in-place-results in-place-div-results)
           bad (remove :ok results)]
       (doseq [r results]
         (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r))

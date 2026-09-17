@@ -10,11 +10,16 @@ for the regular expressions.
 ./sed -n '12,40p'               [FILE...]
 ./sed '/RE/d'                   [FILE...]
 ./sed -E 's/(a|b)+/X/g'         [FILE...]
+./sed -i '' 's/RE/REPLACEMENT/' FILE...      in place (-i.bak keeps a backup)
 ... | ./sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 ```
 
-146 cases agree with `/usr/bin/sed` on stdout, stderr and exit status; six
-named divergences are written out in the suite rather than compared.
+166 cases agree with `/usr/bin/sed` on stdout, stderr, exit status and —
+under `-i` — every file's bytes and mode; seven named divergences are
+written out in the suite rather than compared. Operands may be relative
+(`src/a.txt`, `./x`): the loader resolves them against the directory the
+command started in, then holds them to its scope (amu #1023, 2026-09-17 —
+99,826 of the measured file operands are relative, 17,104 absolute).
 
 ## Which scripts, measured 2026-09-17
 
@@ -26,7 +31,7 @@ By shape:
 | `-n 'N,Mp'` (and several joined by `;`) | 8,762 + 205 | yes |
 | `s` with a metacharacter (`s/^+//`, `s/[[:space:]]*$//`, …) | 3,217 | yes |
 | … with `g`, with `-E`, joined by `;` | 139, 102, ~380 | yes |
-| `-i` (in place) | 1,042 | no — it writes the file |
+| `-i ''` (in place; `-i.bak` once) | 1,042 | yes |
 | `-n '/re/,/re/p'`, `/re/p`, `,+N` | 817 + 59 | yes |
 | `\1` in the replacement | 193 + 105 + 89 | **no** — refused by name |
 | `s` literal | 345 + 57 | yes |
@@ -76,12 +81,31 @@ a^b  a$b  *b BRE: ^ $ * are literal where they cannot anchor or repeat
   and `|`. 17 + 31 measured scripts use them, every one written for the
   GNU meaning and silently a no-op on macOS.
 - Two `+N` addresses in one script: refused (one countdown is kept).
+- A line holding the literal text `WRITE_SEP` or `APPEND_SEP` cannot be
+  written in place: the loader's wire-35 request tokens, refused fail-closed
+  (exit 120). Reading and printing such a line is fine.
 - A bad substitute flag or command letter: `sed: unsupported script`,
   exit 1, where `/usr/bin/sed` names the flag or letter.
 
+## In place: `-i ''`, measured on `/usr/bin/sed`
+
+The argument after `-i` is the backup suffix — `''` for none, so
+`sed -i 's/a/b/' f` takes the script as the suffix and refuses `f` as the
+script, exactly as `/usr/bin/sed` does on macOS. Each operand is its own
+stream (`$` and line numbers restart); the output is appended line by line
+to `<file>.sed-tmp` (the loader's wire-35 APPEND form, one buffered
+descriptor per file), the mode is copied, the original is renamed to the
+backup if a suffix was given, and the temporary is renamed over the
+operand. Nothing reaches standard output. A missing operand or a directory
+stops the run with `/usr/bin/sed`'s words, exit 1, after the operands
+before it were edited and before the ones after it were touched; `-i` with
+no operand is `sed: -I or -i may not be used with stdin`. 20 cases, each
+in a fresh copy of the fixtures with relative operands, compare stdout,
+stderr, exit and every file's bytes and mode.
+
 ## What this is not
 
-No `-i`, `y`, `a`, `i`, `c`, `q`, `{}`, `w`, `N`, hold space, `I` flag,
+No `y`, `a`, `i`, `c`, `q`, `{}`, `w`, `N`, hold space, `I` flag,
 `//` (the last RE), numeric substitute flag (`s/a/b/2`), more than 40
 commands in one script (one bit per command carries range state). Each of
 these is refused, exit 1, never half-done.
@@ -108,7 +132,8 @@ is what counts.
 
 ## Capabilities
 
-`:cli/args` (38), `:fs/app-data` (35), `:io/write` (37), `:io/write-error`
+`:cli/args` (38), `:fs/app-data` (35: read, and under `-i` the WRITE,
+APPEND, STAT, CHMOD and RENAME forms), `:io/write` (37), `:io/write-error`
 (39), `:io/read` (41). A missing operand is reported byte-for-byte and the
 readable ones are still written, exit 1. With a script and no file operand
 `sed` reads standard input, whole; input larger than the binary's string
@@ -119,3 +144,5 @@ pool is refused (exit 120), never edited short.
 ```sh
 AMU_HOME=../amu REGEX_HOME=../org-ieee-regex kbb --backend sci test/sed_test.cljk
 ```
+
+Needs amu at or after #1023 (relative operands, the APPEND form).
