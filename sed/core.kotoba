@@ -8,6 +8,7 @@
 ;;   sed -n '12,40p'               [FILE...]
 ;;   sed '/RE/d'                   [FILE...]
 ;;   sed -E 's/(a|b)+/X/g'         [FILE...]
+;;   sed -i '' 's/RE/REPLACEMENT/' FILE...      in place (2026-09-17)
 ;;
 ;; ## Which scripts, measured 2026-09-17
 ;;
@@ -17,7 +18,9 @@
 ;; by `;`; `-i` 1,042 (not here: it writes the file); `-n '/re/,/re/p'`
 ;; 817 and `/re/p` 59 (some `,+N`); `\1` in the replacement 193 + 105 + 89
 ;; (not here: the engine keeps no capture groups -- refused by name);
-;; `s` literal 345 + 57; `/re/d` 109; `-n 's/../\1/p'` 105.
+;; `s` literal 345 + 57; `/re/d` 109; `-n 's/../\1/p'` 105. `-i ''` since
+;; 2026-09-17 (the wire-35 APPEND form, amu #1023); operands may be
+;; relative since the same landing (the loader resolves them).
 ;;
 ;; ## Semantics, each measured on /usr/bin/sed
 ;;
@@ -50,7 +53,6 @@
 ;; ## Not here, by name
 ;;
 ;;   \1..\9       "unsupported script: \N back-reference" (exit 1)
-;;   -i           writes the file; a different capability
 ;;   y, a, i, c, q, {}, w, N, hold space, `I` flag, `//` (the last RE)
 ;;   two `+N` addresses in one script (one counter is kept)
 ;;   more than 40 commands in one script (one bit per command is kept)
@@ -126,7 +128,14 @@
 ;; --- options -------------------------------------------------------------
 ;; Leading arguments of `-` and letters from `n`, `E`, `e` are options
 ;; (`-n`, `-E`, `-nE`, `-En`, `-e`); the script is the first other argument.
+;; `-i EXT` / `-iEXT` edits the operands in place (2026-09-17; 1,042 of
+;; 15,968 measured scripts, all but one `-i ''`): EXT names the backup
+;; suffix, "" for none -- as /usr/bin/sed reads it, so `sed -i 's/a/b/' f`
+;; takes the script as the suffix and refuses `f` as the script.
 (defn- total [] :i64 (i64-of (arg "")))
+
+(defn- in-place-arg? [a :string] :bool
+  (if (< (string-byte-length a) 2) false (string=? (string-substring a 0 2) "-i")))
 
 (defn- option-letters? [a :string i :i64] :bool
   (if (>= i (string-byte-length a))
@@ -142,14 +151,33 @@
     (if (= (string-code-point-at a 0) 45) (option-letters? a 1) false)))
 
 (defn- script-index-from [i :i64] :i64
-  (if (>= i (total)) i (if (option? (arg (decimal-of i))) (script-index-from (+ i 1)) i)))
+  (if (>= i (total))
+    i
+    (let [a (arg (decimal-of i))]
+      (if (string=? a "-i")
+        (script-index-from (+ i 2))
+        (if (in-place-arg? a)
+          (script-index-from (+ i 1))
+          (if (option? a) (script-index-from (+ i 1)) i))))))
+
+(defn- in-place-from [i :i64] :i64
+  (if (>= i (script-index)) -1 (if (in-place-arg? (arg (decimal-of i))) i (in-place-from (+ i 1)))))
+
+(defn- in-place? [] :bool (>= (in-place-from 0) 0))
+
+;; The backup suffix: the rest of `-iEXT`, or the argument after `-i`.
+(defn- backup-suffix [] :string
+  (let [i (in-place-from 0)
+        a (arg (decimal-of i))]
+    (if (string=? a "-i") (arg (decimal-of (+ i 1))) (string-substring a 2 (string-byte-length a)))))
 
 (defn- script-index [] :i64 (script-index-from 0))
 
 (defn- option-has? [i :i64 letter :string] :bool
   (if (>= i (script-index))
     false
-    (if (>= (string-index-of (arg (decimal-of i)) letter) 0) true (option-has? (+ i 1) letter))))
+    (let [a (arg (decimal-of i))]
+      (if (if (option? a) (>= (string-index-of a letter) 0) false) true (option-has? (+ i 1) letter)))))
 
 (defn- quiet? [] :bool (option-has? 0 "n"))
 (defn- ere? [] :bool (option-has? 0 "E"))
@@ -356,6 +384,18 @@
     (let [c (string-code-point-at sc i)]
       (if (= c 59) i (if (= c 32) i (flags-end sc (+ i 1)))))))
 
+;; The records end with one more field, the SINK: `SINK` for standard
+;; output, `SINK<path>` for the file `-i` appends each line to. A record's
+;; first field is an address type (a digit), so the sink is told apart by
+;; its first byte.
+(defn- at-sink? [cmds :string] :bool
+  (if (>= 0 (string-byte-length cmds)) true (= (string-code-point-at (nth-field cmds 0) 0) 83)))
+
+(defn- sink-of [cmds :string] :string
+  (if (at-sink? cmds)
+    (let [f (nth-field cmds 0)] (string-substring f 4 (string-byte-length f)))
+    (sink-of (string-substring cmds (field-at cmds 8 0) (string-byte-length cmds)))))
+
 ;; Does the script have a second `+N` address from I? One countdown is kept.
 (defn- plus-count [cmds :string i :i64 acc :i64] :i64
   (if (>= i (string-byte-length cmds))
@@ -513,10 +553,19 @@
 (defn- pk-term? [p :i64] :bool (bit-set? p 2))
 (defn- pk-quiet? [p :i64] :bool (bit-set? p 0))
 
-(defn- emit-line [ps :string packed :i64] :i64
-  (do (emit ps)
-      (if (pk-term? packed) (emit (nl)) "")
-      0))
+(defn- fs-request [s :string] :string
+  (typed-cap-call :fs/app-data :string :string s))
+
+;; The line to the sink: standard output, or appended to the `-i` temporary
+;; (one APPEND per line, the line and its newline together).
+(defn- emit-line [ps :string packed :i64 sink :string] :i64
+  (if (= 0 (string-byte-length sink))
+    (do (emit ps)
+        (if (pk-term? packed) (emit (nl)) "")
+        0)
+    (do (fs-request (string-concat (string-concat sink "APPEND_SEP")
+                                   (if (pk-term? packed) (string-concat ps (nl)) ps)))
+        0)))
 
 ;; Whether command K (the record at the head of CMDS) selects this line, and
 ;; its range state after it: OUT * 2 + selected, OUT holding bit k when the
@@ -561,7 +610,7 @@
 ;; The range bits of the commands from the head of CMDS, unchanged: what
 ;; `d` leaves for the commands it stops the cycle before.
 (defn- carry [cmds :string st :i64 out :i64 packed :i64] :i64
-  (if (>= 0 (string-byte-length cmds))
+  (if (at-sink? cmds)
     out
     (let [k (pk-k packed)
           bit (if (bit-set? st k) (pow2 k) 0)
@@ -571,8 +620,8 @@
 ;; One line through the commands at the head of CMDS; answers the range
 ;; state for the next line. Autoprint at the end unless -n.
 (defn- run-cmds [cmds :string ps :string st :i64 out :i64 packed :i64] :i64
-  (if (>= 0 (string-byte-length cmds))
-    (do (if (pk-quiet? packed) 0 (emit-line ps packed)) out)
+  (if (at-sink? cmds)
+    (do (if (pk-quiet? packed) 0 (emit-line ps packed (sink-of cmds))) out)
     (let [r (select cmds ps st out packed)
           out2 (quot r 2)
           selected? (bit-set? r 0)
@@ -581,13 +630,13 @@
       (if (not selected?)
         (run-cmds rest ps st out2 (+ packed 8))
         (if (string=? cmd "p")
-          (do (emit-line ps packed) (run-cmds rest ps st out2 (+ packed 8)))
+          (do (emit-line ps packed (sink-of cmds)) (run-cmds rest ps st out2 (+ packed 8)))
           (if (string=? cmd "d")
             (carry rest st out2 (+ packed 8))
             (let [bits (nth-i64 cmds 7)
                   r2 (substitute (nth-field cmds 5) (nth-field cmds 6) ps (bit-set? bits 0))
                   ps2 (string-substring r2 1 (string-byte-length r2))]
-              (do (if (if (bit-set? bits 1) (= (string-code-point-at r2 0) 49) false) (emit-line ps2 packed) 0)
+              (do (if (if (bit-set? bits 1) (= (string-code-point-at r2 0) 49) false) (emit-line ps2 packed (sink-of cmds)) 0)
                   (run-cmds rest ps2 st out2 (+ packed 8))))))))))
 
 ;; --- lines ---------------------------------------------------------------
@@ -654,8 +703,61 @@
   (let [total (total)
         text (if (>= (+ si 1) total) (stdin "") (gather (+ si 1) total ""))
         last (count-lines text 0 0)]
-    (do (lines text cmds 0 0 (+ (* 2 (+ 67108864 last)) (if (quiet?) 1 0)))
+    (do (lines text (string-concat cmds (lp "SINK")) 0 0 (+ (* 2 (+ 67108864 last)) (if (quiet?) 1 0)))
         (if (all-exist? (+ si 1) total) 0 1))))
+
+;; --- in place ------------------------------------------------------------
+;; Each operand is its own stream (line numbers and `$` restart, as
+;; /usr/bin/sed does under -i). The output goes to `<path>.sed-tmp` one
+;; line at a time, the mode is copied, the original is renamed to the backup
+;; (if a suffix was given), and the temporary is renamed over the operand. A missing
+;; operand, or a directory, is reported with /usr/bin/sed's words and STOPS
+;; the run (exit 1): the operands before it are edited, the ones after it
+;; are not -- measured, and unlike the read-only path, which skips and
+;; goes on. Nothing reaches standard output.
+(defn- stat-of [path :string] :string (fs-request (string-concat path "STAT_SEP")))
+
+(defn- field-n [s :string n :i64 i :i64] :string
+  (let [sp (string-find-byte s 32 i)]
+    (if (<= n 0)
+      (string-substring s i (if (< sp 0) (string-byte-length s) sp))
+      (field-n s (- n 1) (+ sp 1)))))
+
+(defn- octal-of [mode :i64] :string
+  (if (< mode 8) (digit-text mode) (string-concat (octal-of (quot mode 8)) (digit-text (- mode (* 8 (quot mode 8)))))))
+
+(defn- edit-in-place [path :string cmds :string suffix :string] :i64
+  (let [st (stat-of path)
+        text (slurp-file path)
+        tmp (string-concat path ".sed-tmp")
+        mode (- (i64-of (field-n st 0 0)) (* 4096 (quot (i64-of (field-n st 0 0)) 4096)))
+        last (count-lines text 0 0)]
+    (do (fs-request (string-concat tmp "WRITE_SEP"))
+        (lines text (string-concat cmds (lp (string-concat "SINK" tmp))) 0 0 (+ (* 2 (+ 67108864 last)) (if (quiet?) 1 0)))
+        ;; The backup is the original RENAMED (its mode travels with it, as
+        ;; /usr/bin/sed's `-i.bak` leaves a 640 backup of a 640 file).
+        (if (> (string-byte-length suffix) 0)
+          (fs-request (string-concat path (string-concat "RENAME_SEP" (string-concat path suffix))))
+          "")
+        (fs-request (string-concat tmp (string-concat "CHMOD_SEP" (octal-of mode))))
+        (fs-request (string-concat tmp (string-concat "RENAME_SEP" path)))
+        0)))
+
+(defn- each-in-place [i :i64 total :i64 cmds :string suffix :string] :i64
+  (if (>= i total)
+    0
+    (let [path (arg (decimal-of i))]
+      (if (not (exists? path))
+        (complain path)
+        (if (string=? (field-n (stat-of path) 3 0) "1")
+          (do (emit-error "sed: ") (emit-error path) (emit-error ": in-place editing only works for regular files") (emit-error (nl))
+              1)
+          (+ (edit-in-place path cmds suffix) (each-in-place (+ i 1) total cmds suffix)))))))
+
+(defn- run-in-place [cmds :string si :i64] :i64
+  (if (>= (+ si 1) (total))
+    (refuse "" "-I or -i may not be used with stdin")
+    (if (> (each-in-place (+ si 1) (total) cmds (backup-suffix)) 0) 1 0)))
 
 (defn main [] :i64
   (let [si (script-index)]
@@ -669,4 +771,4 @@
             (refuse sc "unsupported script: two +N addresses")
             (if (> (command-count cmds 0 0) 40)
               (refuse sc "unsupported script: more than 40 commands")
-              (run sc cmds si))))))))
+              (if (in-place?) (run-in-place cmds si) (run sc cmds si)))))))))
