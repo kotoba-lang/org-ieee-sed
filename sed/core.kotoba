@@ -17,7 +17,7 @@
 ;; metacharacter 3,217 plain, 139 `g`, 102 `-E`, 207 + 69 + 61 + 43 joined
 ;; by `;`; `-i` 1,042 (not here: it writes the file); `-n '/re/,/re/p'`
 ;; 817 and `/re/p` 59 (some `,+N`); `\1` in the replacement 193 + 105 + 89
-;; (not here: the engine keeps no capture groups -- refused by name);
+;; (since 2026-09-17: rx/captures re-walks the match for its groups);
 ;; `s` literal 345 + 57; `/re/d` 109; `-n 's/../\1/p'` 105. `-i ''` since
 ;; 2026-09-17 (the wire-35 APPEND form, amu #1023); operands may be
 ;; relative since the same landing (the loader resolves them).
@@ -30,6 +30,9 @@
 ;;   s/b*/-/g     `-a-c-`: an empty match right after a match is skipped
 ;;   s/^a/X/g     `Xaa` over `aaa`: `^` is the line start, not the scan start
 ;;   &  \&  \n    the match, a literal `&`, a newline, in the replacement
+;;   \1..\9       group N: macOS libc regex's greedy-first groups
+;;                ((a|ab)(c|bcd) over abcd is [a][bcd]); a group that did
+;;                not take part is empty; past the pattern's groups refused
 ;;   s/a\/b/X/    `\` before the delimiter is the delimiter itself
 ;;   \x1b         a byte by hex (the ANSI-escape stripper agents write)
 ;;   s//-/        an EMPTY pattern is refused: "first RE may not be empty"
@@ -52,7 +55,6 @@
 ;;
 ;; ## Not here, by name
 ;;
-;;   \1..\9       "unsupported script: \N back-reference" (exit 1)
 ;;   y, a, i, c, q, {}, w, N, hold space, `I` flag, `//` (the last RE)
 ;;   two `+N` addresses in one script (one counter is kept)
 ;;   more than 40 commands in one script (one bit per command is kept)
@@ -339,20 +341,21 @@
           (string-substring sc (+ i 1) e)
           (string-substring sc i e))))))
 
-;; The replacement as length-prefixed PIECES, the match going between each
-;; consecutive pair: `a&b` is `1:a1:b`. `\&` is `&`, `\n` a newline, `\t` a tab, any
-;; other `\X` is X; `\1`..`\9` is refused, there being no capture groups.
+;; The replacement as length-prefixed PIECES with a REF field between each
+;; consecutive pair -- `0` for `&` (the match), `1`..`9` for `\N` (the
+;; group; 2026-09-17, rx/captures): `a&b\1` is `1:a1:01:b1:10:`. `\&` is
+;; `&`, `\n` a newline, `\t` a tab, any other `\X` is X.
 (defn- template [rep :string i :i64 piece :string acc :string] :string
   (let [n (string-byte-length rep)]
     (if (>= i n)
       (string-concat acc (lp piece))
       (let [c (string-code-point-at rep i)]
         (if (= c 38)
-          (template rep (+ i 1) "" (string-concat acc (lp piece)))
+          (template rep (+ i 1) "" (string-concat acc (string-concat (lp piece) (lp "0"))))
           (if (if (= c 92) (< (+ i 1) n) false)
             (let [e (string-code-point-at rep (+ i 1))]
               (if (if (>= e 49) (<= e 57) false)
-                "!unsupported script: \\N back-reference"
+                (template rep (+ i 2) "" (string-concat acc (string-concat (lp piece) (lp (string-substring rep (+ i 1) (+ i 2))))))
                 (if (= e 110)
                   (template rep (+ i 2) (string-concat piece (nl)) acc)
                 (if (= e 116)
@@ -360,13 +363,42 @@
                   (template rep (+ (+ i 1) (cp-width e)) (string-concat piece (string-substring rep (+ i 1) (+ (+ i 1) (cp-width e)))) acc)))))
             (template rep (+ i (cp-width c)) (string-concat piece (string-substring rep i (+ i (cp-width c)))) acc)))))))
 
-;; The template TPL with MATCH between its pieces.
-(defn- expand [tpl :string i :i64 match :string acc :string] :string
+;; The highest group a template refers to (0 when only `&` or nothing).
+(defn- max-ref [tpl :string i :i64 acc :i64] :i64
+  (let [j (after-field tpl i)]
+    (if (>= j (string-byte-length tpl))
+      acc
+      (let [r (i64-of (field tpl j))]
+        (max-ref tpl (after-field tpl j) (if (> r acc) r acc))))))
+
+;; Group K of GROUPS (ten `start:end;` tokens, offsets into PS) as text;
+;; a group that did not take part is "".
+(defn- group-text [groups :string k :i64 ps :string] :string
+  (let [i (group-token-at groups k)
+        colon (string-find-byte groups 58 i)
+        semi (string-find-byte groups 59 i)
+        st (string-substring groups i colon)]
+    (if (string=? st "-1")
+      ""
+      (string-substring ps (i64-of st) (i64-of (string-substring groups (+ colon 1) semi))))))
+
+;; The index where token K starts.
+(defn- group-token-at [groups :string k :i64] :i64
+  (if (<= k 0) 0 (+ 1 (string-find-byte groups 59 (group-token-at groups (- k 1))))))
+
+;; The template TPL over PS with GROUPS: pieces with the referenced group
+;; between each pair.
+(defn- expand [tpl :string i :i64 ps :string groups :string acc :string] :string
   (let [j (after-field tpl i)
         out (string-concat acc (field tpl i))]
     (if (>= j (string-byte-length tpl))
       out
-      (expand tpl j match (string-concat out match)))))
+      (expand tpl (after-field tpl j) ps groups
+              (string-concat out (group-text groups (i64-of (field tpl j)) ps))))))
+
+;; GROUPS for a match [S, E) with no capture groups (the literal path).
+(defn- whole-groups [s :i64 e :i64] :string
+  (string-concat (decimal-of s) (string-concat ":" (string-concat (decimal-of e) ";-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;-1:-1;"))))
 
 ;; Substitute flags from I: bit 1 `g`, bit 2 `p`; -1 for any other letter
 ;; or a repeated one (`gg` is refused, as /usr/bin/sed refuses it).
@@ -430,16 +462,20 @@
                   "!unsupported script"
                   (let [pat (compiled-pattern (string-substring sc ps e1) d ere?)
                         tpl (template (string-substring sc (+ e1 wd) e2) 0 "" "")
-                        bits (flag-bits sc (+ e2 wd) 0)]
+                        bits (flag-bits sc (+ e2 wd) 0)
+                        groups (if (error? pat) 0 (if (= (string-code-point-at pat 0) 82) (rx/group-count (unescape-pattern (string-substring sc ps e1) 0 d "" ere?) ere?) 0))]
                     (if (error? pat)
                       pat
                       (if (error? tpl)
                         tpl
+                      ;; `\N` past the pattern's groups: /usr/bin/sed's words.
+                      (if (> (max-ref tpl 0 0) groups)
+                        (string-concat "!\\" (string-concat (decimal-of (max-ref tpl 0 0)) " not defined in the RE"))
                         (if (< bits 0)
                           "!unsupported script"
                           (parse sc (flags-end sc (+ e2 wd))
                                  (string-concat acc (string-concat (lp "s") (string-concat (lp pat) (string-concat (lp tpl) (lp (decimal-of bits))))))
-                                 ere?))))))))
+                                 ere?)))))))))
             "!unsupported script"))))))
 
 ;; The script from I as commands, appended to ACC; `!` + message when it
@@ -502,7 +538,7 @@
     (if (< i 0)
       (if (bit-set? fg 1) (string-concat "0" rest) (string-concat acc rest))
       (let [out (string-concat (string-concat (if (bit-set? fg 1) "1" acc) (string-substring rest 0 i))
-                               (expand tpl 0 lit ""))
+                               (expand tpl 0 rest (whole-groups i (+ i (string-byte-length lit))) ""))
             after (string-substring rest (+ i (string-byte-length lit)) (string-byte-length rest))]
         (if (bit-set? fg 0)
           (subst-lit lit tpl after 1 out)
@@ -527,8 +563,11 @@
           acc
           (let [w (cp-width (string-code-point-at ps s))]
             (subst-rx prog tpl ps (+ (* 4 (+ s w)) (if g? 1 0)) (string-concat acc (string-substring ps from (+ s w))))))
-        (let [out (string-concat (string-concat (if first? "1" acc) (string-substring ps from s))
-                                 (expand tpl 0 (string-substring ps s e) ""))]
+        (let [groups (if (> (max-ref tpl 0 0) 0)
+                       (let [g (rx/captures prog ps 0 n r)] (if (string=? g "!") (whole-groups s e) g))
+                       (whole-groups s e))
+              out (string-concat (string-concat (if first? "1" acc) (string-substring ps from s))
+                                 (expand tpl 0 ps groups ""))]
           (if (not g?)
             (string-concat out (string-substring ps e n))
             (if (> e s)
@@ -692,8 +731,8 @@
 
 (defn- refuse [sc :string message :string] :i64
   (do (emit-error "sed: ")
-      (if (string=? (string-substring message 0 (if (< (string-byte-length message) 9) 0 9)) "RE error:")
-        (do (emit-error "1: \"") (emit-error sc) (emit-error "\\n\": ") 0)
+      (if (if (string=? (string-substring message 0 (if (< (string-byte-length message) 9) 0 9)) "RE error:") true (= (string-code-point-at message 0) 92))
+        (do (emit-error "1: \"") (emit-error sc) (emit-error (nl)) (emit-error "\": ") 0)
         0)
       (emit-error message)
       (emit-error (nl))

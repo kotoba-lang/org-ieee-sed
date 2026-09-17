@@ -70,7 +70,11 @@
    "html"   "<b>x</b> y\n"
    "key"    "sk_live_abcdef123 x\n"
    "diff"   "+added\n-removed\n+\n"
-   "uni"    "h\u00e9llo \u65e5\u672c\n"})
+   "uni"    "h\u00e9llo \u65e5\u672c\n"
+   "abcd"   "abcd\n" "xyz" "xyz\n" "a b" "a b\n" "aaab" "aaab\n"
+   "quoted" "foo \"bar\" baz\n" "offset" ":offset 42 x\nno\n" "fail" "FAIL in (x) (f:1) rest\n"
+   "keys"   "sk_live_abcdef123 and sk_test_zz9\n" "camel" "fooBarBaz\n" "uni2" "x\u65e5\u672cy\n"
+   "version" "v1.2.3\n"})
 
 (def cases
   [["s/X/-/" "plain"] ["s/X/-/g" "plain"]
@@ -165,6 +169,19 @@
    {:argv ["-E" "-n" "/^ab+$/p"] :stdin "ab"} {:argv ["-nE" "/b+/p"] :stdin "ab"} {:argv ["-En" "/b+/p"] :stdin "ab"}
    {:argv ["-e" "s/a/1/"] :stdin "ab"} {:argv ["s/*b/X/"] :stdin "abc"} {:argv ["s/a^b/X/"] :stdin "abc"}
    {:argv ["s/X/-/"] :stdin "nonl"} {:argv ["p"] :stdin "nonl"} {:argv ["-n" "s/X/-/p"] :stdin "nonl"}
+   ;; --- back-references (2026-09-17, rx/captures): 387 measured uses --------
+   ;; The groups are macOS libc regex's greedy-first answers ((a|ab)(c|bcd)
+   ;; over abcd is [a][bcd]), measured on /usr/bin/sed and compared here.
+   {:argv ["-E" "s/(a|ab)(c|bcd)/[\\1][\\2]/"] :stdin "abcd"} {:argv ["-E" "s/(x*)(.*)/[\\1][\\2]/"] :stdin "xyz"}
+   {:argv ["-E" "s/(a*)(a*)/[\\1][\\2]/"] :stdin "aaa"} {:argv ["-E" "s/(a)|(b)/[\\1][\\2]/g"] :stdin "ab"}
+   {:argv ["s/.*\"\\(.*\\)\"/\\1/"] :stdin "quoted"} {:argv ["-n" "s/.*:offset \\([0-9]*\\).*/\\1/p"] :stdin "offset"}
+   {:argv ["-E" "s/^(FAIL|ERROR) in \\(([^)]*)\\) \\(([^:]*):.*/\\1 \\3 \\2/"] :stdin "fail"}
+   {:argv ["-E" "s/(sk_live_|sk_test_)[A-Za-z0-9_]+/\\1<R>/g"] :stdin "keys"} {:argv ["-E" "s/([a-z0-9])([A-Z])/\\1-\\2/g"] :stdin "camel"}
+   {:argv ["-E" "s/(a)(b)?/[\\1][\\2]/"] :stdin "ab"} {:argv ["-E" "s/(ab)*/[\\1]/"] :stdin "abab"} {:argv ["-E" "s/((a)b)/[\\1][\\2]/"] :stdin "ab"}
+   {:argv ["-E" "s/(a)+/[\\1]/"] :stdin "aaa"} {:argv ["-E" "s/(a) (b)/\\2 \\1 & \\\\1/"] :stdin "a b"} {:argv ["-E" "s/(日)(本)/[\\2\\1]/"] :stdin "uni2"}
+   {:argv ["s/\\(a\\)\\(b\\)/\\2\\1/"] :stdin "ab"} {:argv ["-E" "s/^v([0-9]+)\\.([0-9]+)\\.([0-9]+)$/\\1 \\2 \\3/"] :stdin "version"}
+   {:argv ["-E" "s/(a*)*b/[\\1]/"] :stdin "aaab"} {:argv ["-E" "s/(x)/\\1\\1\\1/g"] :stdin "ab"} {:argv ["-E" "s/a(b)?c?/[\\1]/"] :stdin "ab"}
+   {:argv ["s/a/\\1/"] :stdin "ab"} {:argv ["-E" "s/(a)/\\2/"] :stdin "ab"} {:argv ["s/\\(a\\)/\\1/p"] :stdin "ab"}
    ["-n" "/X/p" "plain" "nonl"] ["/X/d" "plain" "two"] ["s/^/> /" "nonl" "empty" "plain"]
    ["-n" "/a/,/b/p" "two" "five"] ["s/[0-9]/N/g" "five" "missing" "two"]])
 
@@ -179,12 +196,9 @@
    {:argv ["s/X/-/gg"] :stdin "plain" :out "" :err "sed: unsupported script\n" :exit 1}
    ;; Another command letter is refused, where /usr/bin/sed would run it.
    {:argv ["-n" "2,3x"] :stdin "five" :out "" :err "sed: unsupported script\n" :exit 1}
-   ;; `\1` needs a capture group and the engine keeps none: refused by name,
-   ;; exit 1, where /usr/bin/sed substitutes. 193 + 105 + 89 measured uses.
-   {:argv ["s/\\(a\\)/\\1\\1/"] :stdin "ab" :out "" :err "sed: unsupported script: \\N back-reference\n" :exit 1}
    ;; A bad pattern: the exit and the shape are /usr/bin/sed's, the message
    ;; after `RE error:` is the engine's own.
-   {:argv ["s/a\\{/b/"] :stdin "ab" :out "" :err "sed: 1: \"s/a\\{/b/\\n\": RE error: braces { } not balanced\n" :exit 1}
+   {:argv ["s/a\\{/b/"] :stdin "ab" :out "" :err "sed: 1: \"s/a\\{/b/\n\": RE error: braces { } not balanced\n" :exit 1}
    ;; Two `+N` ranges: one countdown is kept.
    {:argv ["-n" "/1/,+1p;/4/,+0p"] :stdin "six" :out "" :err "sed: unsupported script: two +N addresses\n" :exit 1}
    ;; BRE `\+` is one-or-more here, as /usr/bin/grep reads it; /usr/bin/sed

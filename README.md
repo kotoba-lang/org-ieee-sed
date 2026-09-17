@@ -14,8 +14,8 @@ for the regular expressions.
 ... | ./sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 ```
 
-166 cases agree with `/usr/bin/sed` on stdout, stderr, exit status and —
-under `-i` — every file's bytes and mode; seven named divergences are
+188 cases agree with `/usr/bin/sed` on stdout, stderr, exit status and —
+under `-i` — every file's bytes and mode; six named divergences are
 written out in the suite rather than compared. Operands may be relative
 (`src/a.txt`, `./x`): the loader resolves them against the directory the
 command started in, then holds them to its scope (amu #1023, 2026-09-17 —
@@ -33,7 +33,7 @@ By shape:
 | … with `g`, with `-E`, joined by `;` | 139, 102, ~380 | yes |
 | `-i ''` (in place; `-i.bak` once) | 1,042 | yes |
 | `-n '/re/,/re/p'`, `/re/p`, `,+N` | 817 + 59 | yes |
-| `\1` in the replacement | 193 + 105 + 89 | **no** — refused by name |
+| `\1` in the replacement | 193 + 105 + 89 | yes (2026-09-17) |
 | `s` literal | 345 + 57 | yes |
 | `/re/d` | 109 | yes |
 | `-n 's/…/…/p'` | 113 | yes |
@@ -47,6 +47,12 @@ s/x*/-/g     -a-b-c- over abc: an empty match at every position
 s/b*/-/g     -a-c-: an empty match right after a match is skipped
 s/^a/X/g     Xaa over aaa: ^ is the line start, not the scan start
 &  \&  \n \t the match, a literal &, a newline, a tab, in the replacement
+\1 .. \9    group N of the match (rx/captures): the groups are macOS libc
+             regex's greedy-first answers -- (a|ab)(c|bcd) over abcd is
+             [a][bcd], (a*)(a*) over aaa is [aaa][], (ab)* over abab is
+             [ab], the last iteration; a group that did not take part is
+             empty; \N past the pattern's groups is refused with
+             /usr/bin/sed's words (`\1 not defined in the RE`)
 s/a\/b/X/    \ before the delimiter is the delimiter itself
 \x1b         a byte by hex (the ANSI-escape stripper agents write)
 \t           a tab, in the pattern too
@@ -71,9 +77,6 @@ a^b  a$b  *b BRE: ^ $ * are literal where they cannot anchor or repeat
 
 ### Named divergences (in the suite as `divergences`, not compared)
 
-- `\1`..`\9` in the replacement: `sed: unsupported script: \N back-reference`,
-  exit 1. The engine keeps no capture groups. 387 measured uses — the
-  largest thing this does not do.
 - A bad pattern: exit 1 and the shape `sed: 1: "SCRIPT\n": RE error: …`
   are `/usr/bin/sed`'s; the message after `RE error:` is the engine's.
 - BRE `\+` and `\|`: one-or-more and alternation here, as `/usr/bin/grep`
